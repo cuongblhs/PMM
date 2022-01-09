@@ -1,0 +1,141 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: "percona"
+
+---
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-pmmdata
+  namespace: "percona"
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 8Gi     
+      
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: pmm-service
+  namespace: "percona"
+  labels:
+    name: pmm
+spec:
+  ports:
+    - port: 8089
+      name: http
+      targetPort: 80
+  selector:
+    app: pmm
+
+---
+
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: "pmm-ingress"
+  namespace: "percona"
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/scheme: internet-facing
+
+    alb.ingress.kubernetes.io/healthcheck-path: /
+    alb.ingress.kubernetes.io/healthcheck-port: traffic-port
+    alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 8089}]'
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=200
+    alb.ingress.kubernetes.io/inbound-cidrs: 42.115.146.197/32,113.20.107.215/32
+  labels:
+    app: pmm-ingress
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /*
+            backend:
+              serviceName: "pmm-service"
+              servicePort: 8089
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pmm-server
+  namespace: "percona"
+  labels:
+    app: pmm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pmm
+  template:
+    metadata:
+      labels:
+        app: pmm
+    spec:
+      nodeSelector:
+        topology.kubernetes.io/zone: ap-southeast-1a
+      containers:
+        - name: pmm
+          image: percona/pmm-server:2
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: pmmdata
+              mountPath: /pmmdata
+          command: ["bash"]
+          args:
+            - "-c"
+            - |
+              # mount data to node
+              set -ex
+              if [[ $EUID != 1000 ]]; then
+                  # logrotate requires UID in /etc/passwd
+                  sed -e "s^x:1000:^x:$EUID:^" /etc/passwd > /tmp/passwd
+                  cat /tmp/passwd > /etc/passwd
+                  rm -rf /tmp/passwd
+              fi
+              if [ ! -f /pmmdata/app-init ]; then
+                  # the PV hasn't been initialized, so copy over default
+                  # pmm-server directories before symlinking
+                  mkdir -p /pmmdata
+                  rsync -a --owner=$EUID /srv/prometheus/data/  /pmmdata/prometheus-data/
+                  rsync -a --owner=$EUID /srv/prometheus/rules/ /pmmdata/prometheus-rules/
+                  rsync -a --owner=$EUID /srv/postgres/         /pmmdata/postgres/
+                  rsync -a --owner=$EUID /srv/grafana/          /pmmdata/grafana/
+                  rsync -a --owner=$EUID /srv/clickhouse/       /pmmdata/clickhouse/
+                  rsync -a --owner=$EUID /srv/victoriametrics/  /pmmdata/victoriametrics/
+                  # initialize the PV and then mark it complete
+                  touch /pmmdata/app-init
+              fi
+              # remove the default directories so we can symlink the
+              # existing PV directories
+              rm -Rf /srv/prometheus/data
+              rm -Rf /srv/prometheus/rules
+              rm -Rf /srv/postgres
+              rm -Rf /srv/grafana
+              rm -Rf /srv/clickhouse
+              rm -Rf /srv/victoriametrics
+              # symlink pmm-server paths to point to our PV
+              ln -s /pmmdata/prometheus-data  /srv/prometheus/data
+              ln -s /pmmdata/prometheus-rules /srv/prometheus/rules
+              ln -s /pmmdata/postgres         /srv/
+              ln -s /pmmdata/grafana          /srv/
+              ln -s /pmmdata/clickhouse       /srv/
+              ln -s /pmmdata/victoriametrics  /srv/
+              sed -ri "s/(^log_directory = ).*/\1\'\/srv\/logs\'/g" /pmmdata/postgres/postgresql.conf
+              chmod 700 /pmmdata/postgres
+              bash -x /opt/entrypoint.sh
+      volumes:
+        - name: pmmdata
+          persistentVolumeClaim:
+            claimName: pvc-pmmdata
